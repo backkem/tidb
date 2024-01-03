@@ -63,8 +63,10 @@ const (
 	DefIndexLimit = 64
 	// DefMaxOfIndexLimit is the maximum limitation of index on a single table for TiDB.
 	DefMaxOfIndexLimit = 64 * 8
-	// DefPort is the default port of TiDB
+	// DefPort is the default MySQL port of TiDB
 	DefPort = 4000
+	// DefPort is the default Apache Arrow Flight SQL port of TiDB
+	DefFlightPort = 4001
 	// DefStatusPort is the default status port of TiDB
 	DefStatusPort = 10080
 	// DefHost is the default host of TiDB
@@ -174,6 +176,7 @@ type Config struct {
 	Host             string `toml:"host" json:"host"`
 	AdvertiseAddress string `toml:"advertise-address" json:"advertise-address"`
 	Port             uint   `toml:"port" json:"port"`
+	FlightPort       uint   `toml:"port" json:"flight-port"`
 	Cors             string `toml:"cors" json:"cors"`
 	Store            string `toml:"store" json:"store"`
 	Path             string `toml:"path" json:"path"`
@@ -896,6 +899,7 @@ var defaultConf = Config{
 	Host:                         DefHost,
 	AdvertiseAddress:             "",
 	Port:                         DefPort,
+	FlightPort:                   DefFlightPort,
 	Socket:                       "/tmp/tidb-{Port}.sock",
 	Cors:                         "",
 	Store:                        "unistore",

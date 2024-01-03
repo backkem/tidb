@@ -32,6 +32,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	goerrors "errors"
 	"fmt"
 	"io"
 	"net"
@@ -115,6 +116,8 @@ type Server struct {
 	driver            IDriver
 	listener          net.Listener
 	socket            net.Listener
+	flightListener    net.Listener
+	flightSQLServer   *FlightSQLServer
 	concurrentLimiter *TokenLimiter
 
 	rwlock                 sync.RWMutex
@@ -305,6 +308,21 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 		}
 	}
 
+	if s.cfg.Host != "" && (s.cfg.FlightPort != 0 || RunInGoTest) {
+		addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(int(s.cfg.FlightPort)))
+		tcpProto := "tcp"
+		if s.cfg.EnableTCP4Only {
+			tcpProto = "tcp4"
+		}
+		if s.flightListener, err = net.Listen(tcpProto, addr); err != nil {
+			return nil, errors.Trace(err)
+		}
+		logutil.BgLogger().Info("server is running Arrow protocol", zap.String("addr", addr))
+		if RunInGoTest && s.cfg.FlightPort == 0 {
+			s.cfg.FlightPort = uint(s.flightListener.Addr().(*net.TCPAddr).Port)
+		}
+	}
+
 	if s.cfg.Socket != "" {
 		if err := cleanupStaleSocket(s.cfg.Socket); err != nil {
 			return nil, errors.Trace(err)
@@ -430,14 +448,36 @@ func (s *Server) Run() error {
 	}
 	// If error should be reported and exit the server it can be sent on this
 	// channel. Otherwise, end with sending a nil error to signal "done"
-	errChan := make(chan error, 2)
+	numRunners := 3
+	errChan := make(chan error, numRunners)
 	go s.startNetworkListener(s.listener, false, errChan)
 	go s.startNetworkListener(s.socket, true, errChan)
-	err := <-errChan
-	if err != nil {
-		return err
+	go s.startFlightServer(s.flightListener, errChan)
+
+	errs := []error{}
+	for i := 0; i < numRunners; i++ {
+		err := <-errChan
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return <-errChan
+	return goerrors.Join(errs...)
+}
+
+func (s *Server) startFlightServer(listener net.Listener, errChan chan error) {
+	errChan <- func() error {
+		if listener == nil {
+			return nil
+		}
+		server, err := NewFlightSQLServer(s)
+		if err != nil {
+			return err
+		}
+
+		s.flightSQLServer = server
+
+		return server.Serve(listener)
+	}()
 }
 
 func (s *Server) startNetworkListener(listener net.Listener, isUnixSocket bool, errChan chan error) {
@@ -564,6 +604,15 @@ func (s *Server) closeListener() {
 		err := s.socket.Close()
 		terror.Log(errors.Trace(err))
 		s.socket = nil
+	}
+	if s.flightSQLServer != nil {
+		s.flightSQLServer.Shutdown()
+		s.flightSQLServer = nil
+	}
+	if s.flightListener != nil {
+		err := s.flightListener.Close()
+		terror.Log(errors.Trace(err))
+		s.flightListener = nil
 	}
 	if s.statusServer != nil {
 		err := s.statusServer.Close()
