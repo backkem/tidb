@@ -365,8 +365,8 @@ func (s *Server) initTiDBListener() (err error) {
 		}
 	}
 
-	if s.cfg.Host != "" && (s.cfg.FlightPort != 0 || RunInGoTest) {
-		addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(int(s.cfg.FlightPort)))
+	if s.cfg.Host != "" && (s.cfg.FlightSQLPort != 0 || RunInGoTest) {
+		addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(int(s.cfg.FlightSQLPort)))
 		tcpProto := "tcp"
 		if s.cfg.EnableTCP4Only {
 			tcpProto = "tcp4"
@@ -375,8 +375,8 @@ func (s *Server) initTiDBListener() (err error) {
 			return errors.Trace(err)
 		}
 		logutil.BgLogger().Info("server is running Arrow protocol", zap.String("addr", addr))
-		if RunInGoTest && s.cfg.FlightPort == 0 {
-			s.cfg.FlightPort = uint(s.flightListener.Addr().(*net.TCPAddr).Port)
+		if RunInGoTest && s.cfg.FlightSQLPort == 0 {
+			s.cfg.FlightSQLPort = uint(s.flightListener.Addr().(*net.TCPAddr).Port)
 		}
 	}
 
