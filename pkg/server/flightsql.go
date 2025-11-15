@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -36,6 +38,10 @@ type FlightSQLServer struct {
 
 	tidbAllocator  chunk.Allocator
 	arrowAllocator memory.Allocator
+
+	// Transaction management
+	transactions sync.Map // map[string]*TiDBContext for active transactions
+	nextTxnID    atomic.Uint64
 }
 
 func NewFlightSQLServer(server *Server) (*FlightSQLServer, error) {
@@ -100,11 +106,11 @@ func (s *FlightSQLServer) GetSchemaSubstraitPlan(ctx context.Context, plan fligh
 }
 
 func (s *FlightSQLServer) DoGetStatement(ctx context.Context, cmd flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	_, query, err := decodeTransactionQuery(cmd.GetStatementHandle())
+	txnID, query, err := decodeTransactionQuery(cmd.GetStatementHandle())
 	if err != nil {
 		return nil, nil, err
 	}
-	logutil.BgLogger().Info("DoGetStatement", zap.String("query", query))
+	logutil.BgLogger().Info("DoGetStatement", zap.String("query", query), zap.String("txn_id", txnID))
 
 	// Extract database from metadata, default to empty string if not provided
 	var dbName string
@@ -113,9 +119,28 @@ func (s *FlightSQLServer) DoGetStatement(ctx context.Context, cmd flightsql.Stat
 		dbName = dbs[0]
 	}
 
-	ct, err := s.server.driver.OpenCtx(uint64(0), 0, uint8(tmysql.DefaultCollationID), dbName, nil, nil)
-	if err != nil {
-		return nil, nil, err
+	// Check if this query is part of a transaction
+	var ct *TiDBContext
+	var shouldClose bool = true
+
+	if txnID != "" {
+		// Use existing transaction context
+		val, ok := s.transactions.Load(txnID)
+		if !ok {
+			return nil, nil, fmt.Errorf("transaction not found: %s", txnID)
+		}
+		ct = val.(*TiDBContext)
+		shouldClose = false // Don't close transaction context
+	} else {
+		// Create new context for this query
+		ct, err = s.server.driver.OpenCtx(uint64(0), 0, uint8(tmysql.DefaultCollationID), dbName, nil, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if shouldClose {
+		defer ct.Close()
 	}
 
 	// Only execute USE statement if a database was specified
@@ -285,13 +310,39 @@ func (s *FlightSQLServer) DoGetPreparedStatement(ctx context.Context, cmd flight
 }
 
 func (s *FlightSQLServer) GetFlightInfoCatalogs(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	panic("GetFlightInfoCatalogs not implemented")
+	// In TiDB, there's only one catalog (similar to MySQL)
+	// Return FlightInfo with the standard schema
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "catalog_name", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	return &flight.FlightInfo{
+		Schema:           flight.SerializeSchema(schema, s.arrowAllocator),
+		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: desc.Cmd}}},
+		FlightDescriptor: desc,
+		TotalRecords:     -1,
+		TotalBytes:       -1,
+	}, nil
 }
 
 func (s *FlightSQLServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	panic("DoGetCatalogs not implemented")
+	// TiDB has a single default catalog named "def" (like MySQL)
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "catalog_name", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	builder := array.NewRecordBuilder(s.arrowAllocator, schema)
+	defer builder.Release()
+
+	// Add the default catalog
+	builder.Field(0).(*array.StringBuilder).Append("def")
+
+	rec := builder.NewRecord()
+	ch := make(chan flight.StreamChunk, 1)
+	ch <- flight.StreamChunk{Data: rec}
+	close(ch)
+
+	return schema, ch, nil
 }
 
 func (s *FlightSQLServer) GetFlightInfoXdbcTypeInfo(ctx context.Context, cmd flightsql.GetXdbcTypeInfo, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
@@ -314,33 +365,155 @@ func (s *FlightSQLServer) DoGetSqlInfo(ctx context.Context, cmd flightsql.GetSql
 }
 
 func (s *FlightSQLServer) GetFlightInfoSchemas(ctx context.Context, cmd flightsql.GetDBSchemas, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	panic("GetFlightInfoSchemas not implemented")
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "catalog_name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "db_schema_name", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	return &flight.FlightInfo{
+		Schema:           flight.SerializeSchema(schema, s.arrowAllocator),
+		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: desc.Cmd}}},
+		FlightDescriptor: desc,
+		TotalRecords:     -1,
+		TotalBytes:       -1,
+	}, nil
 }
 
 func (s *FlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	panic("DoGetDBSchemas not implemented")
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "catalog_name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "db_schema_name", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	if s.server.dom == nil {
+		return nil, nil, errors.New("domain not available")
+	}
+
+	is := s.server.dom.InfoSchema()
+	if is == nil {
+		return nil, nil, errors.New("info schema not available")
+	}
+
+	builder := array.NewRecordBuilder(s.arrowAllocator, schema)
+	defer builder.Release()
+
+	// Get all database names
+	dbNames := is.AllSchemaNames()
+	catalogField := builder.Field(0).(*array.StringBuilder)
+	schemaField := builder.Field(1).(*array.StringBuilder)
+
+	for _, dbName := range dbNames {
+		catalogField.Append("def") // Default catalog
+		schemaField.Append(dbName.O)
+	}
+
+	rec := builder.NewRecord()
+	ch := make(chan flight.StreamChunk, 1)
+	ch <- flight.StreamChunk{Data: rec}
+	close(ch)
+
+	return schema, ch, nil
 }
 
 func (s *FlightSQLServer) GetFlightInfoTables(ctx context.Context, cmd flightsql.GetTables, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	panic("GetFlightInfoTables not implemented")
+	// Simplified schema (without optional table_schema field)
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "catalog_name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "db_schema_name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "table_name", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "table_type", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	return &flight.FlightInfo{
+		Schema:           flight.SerializeSchema(schema, s.arrowAllocator),
+		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: desc.Cmd}}},
+		FlightDescriptor: desc,
+		TotalRecords:     -1,
+		TotalBytes:       -1,
+	}, nil
 }
 
 func (s *FlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	panic("DoGetTables not implemented")
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "catalog_name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "db_schema_name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "table_name", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "table_type", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	if s.server.dom == nil {
+		return nil, nil, errors.New("domain not available")
+	}
+
+	is := s.server.dom.InfoSchema()
+	if is == nil {
+		return nil, nil, errors.New("info schema not available")
+	}
+
+	builder := array.NewRecordBuilder(s.arrowAllocator, schema)
+	defer builder.Release()
+
+	catalogField := builder.Field(0).(*array.StringBuilder)
+	schemaField := builder.Field(1).(*array.StringBuilder)
+	tableField := builder.Field(2).(*array.StringBuilder)
+	typeField := builder.Field(3).(*array.StringBuilder)
+
+	// Iterate all schemas and their tables
+	allSchemas := is.AllSchemas()
+	for _, dbInfo := range allSchemas {
+		// Iterate tables in this schema
+		for tableName := range dbInfo.TableName2ID {
+			catalogField.Append("def")
+			schemaField.Append(dbInfo.Name.O)
+			tableField.Append(tableName)
+			typeField.Append("BASE TABLE") // All are base tables in TiDB
+		}
+	}
+
+	rec := builder.NewRecord()
+	ch := make(chan flight.StreamChunk, 1)
+	ch <- flight.StreamChunk{Data: rec}
+	close(ch)
+
+	return schema, ch, nil
 }
 
 func (s *FlightSQLServer) GetFlightInfoTableTypes(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	panic("GetFlightInfoTableTypes not implemented")
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_type", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	return &flight.FlightInfo{
+		Schema:           flight.SerializeSchema(schema, s.arrowAllocator),
+		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: desc.Cmd}}},
+		FlightDescriptor: desc,
+		TotalRecords:     -1,
+		TotalBytes:       -1,
+	}, nil
 }
 
 func (s *FlightSQLServer) DoGetTableTypes(ctx context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	panic("DoGetTableTypes not implemented")
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "table_type", Type: arrow.BinaryTypes.String, Nullable: false},
+	}, nil)
 
+	builder := array.NewRecordBuilder(s.arrowAllocator, schema)
+	defer builder.Release()
+
+	// TiDB supports these table types
+	tableTypes := []string{"BASE TABLE", "VIEW", "SYSTEM VIEW"}
+	typeField := builder.Field(0).(*array.StringBuilder)
+
+	for _, tableType := range tableTypes {
+		typeField.Append(tableType)
+	}
+
+	rec := builder.NewRecord()
+	ch := make(chan flight.StreamChunk, 1)
+	ch <- flight.StreamChunk{Data: rec}
+	close(ch)
+
+	return schema, ch, nil
 }
 
 func (s *FlightSQLServer) GetFlightInfoPrimaryKeys(ctx context.Context, ref flightsql.TableRef, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
@@ -385,7 +558,8 @@ func (s *FlightSQLServer) DoGetCrossReference(ctx context.Context, ref flightsql
 
 func (s *FlightSQLServer) DoPutCommandStatementUpdate(ctx context.Context, cmd flightsql.StatementUpdate) (int64, error) {
 	query := cmd.GetQuery()
-	logutil.BgLogger().Info("DoPutCommandStatementUpdate", zap.String("query", query))
+	txnID := string(cmd.GetTransactionId())
+	logutil.BgLogger().Info("DoPutCommandStatementUpdate", zap.String("query", query), zap.String("txn_id", txnID))
 
 	// Extract database from metadata if provided
 	var dbName string
@@ -394,11 +568,30 @@ func (s *FlightSQLServer) DoPutCommandStatementUpdate(ctx context.Context, cmd f
 		dbName = dbs[0]
 	}
 
-	ct, err := s.server.driver.OpenCtx(uint64(0), 0, uint8(tmysql.DefaultCollationID), dbName, nil, nil)
-	if err != nil {
-		return 0, err
+	// Check if this query is part of a transaction
+	var ct *TiDBContext
+	var shouldClose bool = true
+
+	if txnID != "" {
+		// Use existing transaction context
+		val, ok := s.transactions.Load(txnID)
+		if !ok {
+			return 0, fmt.Errorf("transaction not found: %s", txnID)
+		}
+		ct = val.(*TiDBContext)
+		shouldClose = false // Don't close transaction context
+	} else {
+		// Create new context for this query
+		var err error
+		ct, err = s.server.driver.OpenCtx(uint64(0), 0, uint8(tmysql.DefaultCollationID), dbName, nil, nil)
+		if err != nil {
+			return 0, err
+		}
 	}
-	defer ct.Close()
+
+	if shouldClose {
+		defer ct.Close()
+	}
 
 	// Only execute USE statement if a database was specified
 	if dbName != "" {
@@ -667,8 +860,35 @@ func (s *FlightSQLServer) DoPutPreparedStatementUpdate(ctx context.Context, cmd 
 }
 
 func (s *FlightSQLServer) BeginTransaction(ctx context.Context, cmd flightsql.ActionBeginTransactionRequest) (id []byte, err error) {
-	panic("BeginTransaction not implemented")
+	logutil.BgLogger().Info("BeginTransaction")
 
+	// Generate unique transaction ID
+	txnID := fmt.Sprintf("txn_%d", s.nextTxnID.Add(1))
+
+	// Create a new context for this transaction
+	ct, err := s.server.driver.OpenCtx(uint64(0), 0, uint8(tmysql.DefaultCollationID), "", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Begin transaction by executing BEGIN statement
+	beginStmt, err := ct.Parse(ctx, "BEGIN")
+	if err != nil {
+		ct.Close()
+		return nil, err
+	}
+
+	_, err = ct.ExecuteStmt(ctx, beginStmt[0])
+	if err != nil {
+		ct.Close()
+		return nil, err
+	}
+
+	// Store the context for this transaction
+	s.transactions.Store(txnID, ct)
+
+	logutil.BgLogger().Info("Transaction started", zap.String("txn_id", txnID))
+	return []byte(txnID), nil
 }
 
 func (s *FlightSQLServer) BeginSavepoint(ctx context.Context, cmd flightsql.ActionBeginSavepointRequest) (id []byte, err error) {
@@ -682,8 +902,48 @@ func (s *FlightSQLServer) EndSavepoint(ctx context.Context, cmd flightsql.Action
 }
 
 func (s *FlightSQLServer) EndTransaction(ctx context.Context, cmd flightsql.ActionEndTransactionRequest) error {
-	panic("EndTransaction not implemented")
+	txnID := string(cmd.GetTransactionId())
+	action := cmd.GetAction()
 
+	logutil.BgLogger().Info("EndTransaction",
+		zap.String("txn_id", txnID),
+		zap.Int32("action", int32(action)))
+
+	// Retrieve the transaction context
+	val, ok := s.transactions.Load(txnID)
+	if !ok {
+		return fmt.Errorf("transaction not found: %s", txnID)
+	}
+
+	ct := val.(*TiDBContext)
+	defer func() {
+		s.transactions.Delete(txnID)
+		ct.Close()
+	}()
+
+	// Execute COMMIT or ROLLBACK
+	var sql string
+	if action == flightsql.EndTransactionCommit {
+		sql = "COMMIT"
+	} else {
+		sql = "ROLLBACK"
+	}
+
+	stmt, err := ct.Parse(ctx, sql)
+	if err != nil {
+		return err
+	}
+
+	_, err = ct.ExecuteStmt(ctx, stmt[0])
+	if err != nil {
+		return err
+	}
+
+	logutil.BgLogger().Info("Transaction ended",
+		zap.String("txn_id", txnID),
+		zap.String("action", sql))
+
+	return nil
 }
 
 func (s *FlightSQLServer) CancelFlightInfo(ctx context.Context, cmd *flight.CancelFlightInfoRequest) (flight.CancelFlightInfoResult, error) {
